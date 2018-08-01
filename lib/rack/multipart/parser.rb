@@ -13,6 +13,8 @@ module Rack
         Tempfile.new(["RackMultipart", ::File.extname(filename.gsub("\0".freeze, '%00'.freeze))])
       }
 
+      BOUNDARY_REGEX = /\A([^\n]*(?:\n|\Z))/
+
       class BoundedIO # :nodoc:
         def initialize(io, content_length)
           @io             = io
@@ -166,8 +168,6 @@ module Rack
       attr_reader :state
 
       def initialize(boundary, tempfile, bufsize, query_parser)
-        @buf            = String.new
-
         @query_parser   = query_parser
         @params         = query_parser.make_params
         @boundary       = "--#{boundary}"
@@ -180,11 +180,15 @@ module Rack
         @state = :FAST_FORWARD
         @mime_index = 0
         @collector = Collector.new tempfile
+
+        @sbuf = StringScanner.new(+'')
+        @body_regex = /(.*?)(#{EOL})?#{Regexp.quote(@boundary)}(#{EOL}|--)/m
+        @head_regex = /(.*?#{EOL})#{EOL}/m
       end
 
-      def on_read content
+      def on_read(content)
         handle_empty_content!(content)
-        @buf << content
+        @sbuf.concat content
         run_parser
       end
 
@@ -229,19 +233,18 @@ module Rack
 
       def handle_consume_token
         tok = consume_boundary
+
         # break if we're at the end of a buffer, but not if it is the end of a field
-        if tok == :END_BOUNDARY || (@buf.empty? && tok != :BOUNDARY)
-          @state = :DONE
+        @state = if tok == :END_BOUNDARY || (@sbuf.eos? && tok != :BOUNDARY)
+          :DONE
         else
-          @state = :MIME_HEAD
+          :MIME_HEAD
         end
       end
 
       def handle_mime_head
-        if @buf.index(EOL + EOL)
-          i = @buf.index(EOL + EOL)
-          head = @buf.slice!(0, i + 2) # First \r\n
-          @buf.slice!(0, 2)          # Second \r\n
+        if @sbuf.scan_until(@head_regex)
+          head = @sbuf[1]
 
           content_type = head[MULTIPART_CONTENT_TYPE, 1]
           if name = head[MULTIPART_CONTENT_DISPOSITION, 1]
@@ -264,18 +267,18 @@ module Rack
       end
 
       def handle_mime_body
-        if i = @buf.index(rx)
-          # Save the rest.
-          @collector.on_mime_body @mime_index, @buf.slice!(0, i)
-          @buf.slice!(0, 2) # Remove \r\n after the content
+        if @sbuf.check_until(@body_regex) # check but do not advance the pointer yet
+          mime_body = @sbuf[1]
+          @collector.on_mime_body(@mime_index, mime_body)
+          @sbuf.pos += mime_body.length + 2 # skip \r\n after the content
           @state = :CONSUME_TOKEN
           @mime_index += 1
         else
-          # Save the read body part.
-          if @rx_max_size < @buf.size
-            chunk = @buf.slice!(0, @buf.size - @rx_max_size)
-            @collector.on_mime_body @mime_index, chunk
-            chunk.clear # deallocate chunk
+          # Save what we have so far
+          if @rx_max_size < @sbuf.rest_size
+            delta = @sbuf.rest_size - @rx_max_size
+            @collector.on_mime_body @mime_index, @sbuf.peek(delta)
+            @sbuf.pos += delta
           end
           :want_read
         end
@@ -286,13 +289,12 @@ module Rack
       def rx; @rx; end
 
       def consume_boundary
-        while @buf.gsub!(/\A([^\n]*(?:\n|\Z))/, '')
-          read_buffer = $1
+        while (read_buffer = @sbuf.scan_until(BOUNDARY_REGEX))
           case read_buffer.strip
           when full_boundary then return :BOUNDARY
           when @end_boundary then return :END_BOUNDARY
           end
-          return if @buf.empty?
+          return if @sbuf.eos?
         end
       end
 
